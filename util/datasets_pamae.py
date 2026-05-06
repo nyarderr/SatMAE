@@ -18,42 +18,39 @@ import torch
 from torch.utils.data import Dataset
 import rasterio
 
+
+
 # ──────────────────────────────────────────────────────────
 # Per-band normalization statistics for Sentinel-2 (SR Harmonized)
-# These are approximate pan-European statistics from LUCAS footprints.
-# They will be refined during Phase 2 once a statistics pass is run
-# over the full dataset.  For now they are reasonable defaults that
-# keep all bands on a comparable scale after z-score normalization.
+# Computed from the full LUCAS 2015 footprint (21,859 patches).
 # Order: B2, B3, B4, B5, B6, B7, B8, B8A, B9, B11, B12
 # ──────────────────────────────────────────────────────────
-
-
 SENTINEL2_MEAN = np.array([
-    1370.0,  # B2  (Blue)
-    1184.0,  # B3  (Green)
-    1121.0,  # B4  (Red)
-    1136.0,  # B5  (Red Edge 1)
-    1264.0,  # B6  (Red Edge 2)
-    1645.0,  # B7  (Red Edge 3)
-    1847.0,  # B8  (NIR)
-    1763.0,  # B8A (Narrow NIR)
-    1973.0,  # B9  (Water Vapour)
-    1732.0,  # B11 (SWIR1)
-    1248.0,  # B12 (SWIR2)
+    1231.4369,  # B2  (Blue)
+    1129.0387,  # B3  (Green)
+    1083.5897,  # B4  (Red)
+    1355.7840,  # B5  (Red Edge 1)
+    2294.3097,  # B6  (Red Edge 2)
+    2714.0133,  # B7  (Red Edge 3)
+    2638.9298,  # B8  (NIR)
+    2996.8252,  # B8A (Narrow NIR)
+     834.5295,  # B9  (Water Vapour)
+    2159.2555,  # B11 (SWIR1)
+    1313.9845,  # B12 (SWIR2)
 ], dtype=np.float32)
-
+ 
 SENTINEL2_STD = np.array([
-    633.0,   # B2
-    650.0,   # B3
-    712.0,   # B4
-    965.0,   # B5
-    949.0,   # B6
-    1108.0,  # B7
-    1258.0,  # B8
-    1233.0,  # B8A
-    1364.0,  # B9
-    1310.0,  # B11
-    1087.0,  # B12
+    389.9216,  # B2
+    407.0678,  # B3
+    573.0755,  # B4
+    543.0045,  # B5
+    481.1533,  # B6
+    549.6809,  # B7
+    530.1643,  # B8
+    582.9163,  # B8A
+    244.4357,  # B9
+    773.2597,  # B11
+    643.3582,  # B12
 ], dtype=np.float32)
 
 
@@ -82,7 +79,7 @@ class PAMAEDataset(Dataset):
         Path to a text file with one point_id per line
         (e.g. pretrain.txt, finetune_train.txt).
     metadata_csv : str
-        Path to lucas_metadata.csv with columns:
+        Path to lucas_metadata_final.csv with columns:
         point_id, lat, lon, soc_gkg, elevation, precip_mm
     sentinel2_dir : str
         Directory containing <point_id>.tif Sentinel-2 patches.
@@ -105,20 +102,39 @@ class PAMAEDataset(Dataset):
         self.sentinel2_dir = sentinel2_dir
         self.slope_dir = slope_dir
 
-        # Load point IDs
+        # Load point IDs from text file,
         with open(ids_file, 'r') as f:
-            self.point_ids = [line.strip() for line in f if line.strip()]
-            assert len(self.point_ids) > 0, f"No point IDs found in {ids_file}"
-        
-        # Load metadata CSV
+            raw_ids = [line.strip() for line in f if line.strip()]
+    
+        # Load metadata CSV and set index to point_id for fast lookup
         meta = pd.read_csv(metadata_csv)
         meta['point_id'] = meta['point_id'].astype(str)  # Ensure point_id is string
         self.meta = meta.set_index('point_id')  # For fast lookup
 
+        # Filter IDs to those present in metadata and both Sentinel-2 and slope directories
+        valid_ids = []
+        for pid in raw_ids:
+            # Check CSV first (fastest)
+            if pid not in self.meta.index:
+                print(f"Warning: point_id {pid} not found in metadata, skipping.")
+                continue
+                
+            # Check disk
+            s2_path = os.path.join(self.sentinel2_dir, f"{pid}.tif")
+            slope_path = os.path.join(self.slope_dir, f"{pid}.tif")
+            
+            if os.path.isfile(s2_path) and os.path.isfile(slope_path):
+                valid_ids.append(pid)
+            else:
+                print(f"Warning: Missing .tif files for point_id {pid}, skipping.")
+
+        self.point_ids = valid_ids
+        # Optional: trim meta to only include the valid IDs to save a bit of RAM
+        self.meta = self.meta.loc[self.point_ids] 
 
         # Normalization stats
-        band_mean = band_mean if band_mean is not None else SENTINEL2_MEAN
-        band_std = band_std if band_std is not None else SENTINEL2_STD
+        self.band_mean = band_mean if band_mean is not None else SENTINEL2_MEAN
+        self.band_std = band_std if band_std is not None else SENTINEL2_STD
 
 
         # Reshape for broadcasting: (C, 1, 1)
@@ -198,7 +214,7 @@ def build_pamae_dataset(args, mode:str = "pretrain"):
 
     data_dir = args.data_dir
 
-    metadata_csv = os.path.join(data_dir, "lucas_metadata.csv")
+    metadata_csv = os.path.join(data_dir, "lucas_metadata_final.csv")
     sentinel2_dir = os.path.join(data_dir, "sentinel2")
     slope_dir = os.path.join(data_dir, "slope")
 
