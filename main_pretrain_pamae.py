@@ -14,6 +14,14 @@ Fork of SatMAE's main_pretrain.py, modified to:
      used in Phase 2 when the physics-aware Coherence Loss is added).
   4. Add --data_dir and --ids_file arguments.
 
+Phase 2 update:
+Uses the PAMAEViT model with Pedological Coherence
+Loss. The training loop passes slope and precipitation tensors to the
+model, and logs three separate losses:
+  - loss_total:   L_recon + λ * L_coherence
+  - loss_recon:   standard MAE reconstruction MSE
+  - loss_physics: pedological coherence penalty
+
 """
 
 import argparse
@@ -41,6 +49,7 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.datasets_pamae import build_pamae_dataset
  
 import models_mae
+import models_mae_pamae
 import models_mae_group_channels
  
 import util.lr_sched as lr_sched
@@ -60,7 +69,9 @@ def train_one_epoch_pamae(model: torch.nn.Module,
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
+    metric_logger.add_meter('loss_recon', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_physics', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    header = f'Epoch: [{epoch}]'
     print_freq = 20
 
     accum_iter = args.accum_iter
@@ -80,27 +91,33 @@ def train_one_epoch_pamae(model: torch.nn.Module,
             )
  
         images = images.to(device, non_blocking=True)
-        # slope and precip are loaded but not yet used by the MAE
-        # reconstruction loss.  They will be consumed by the Coherence
-        # Loss in Phase 2.
-        # slope  = slope.to(device, non_blocking=True)
-        # precip = precip.to(device, non_blocking=True)
+        
+    
+        slope  = slope.to(device, non_blocking=True)
+        precip = precip.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast():
-            loss, _, _ = model(images, mask_ratio=args.mask_ratio)
+            loss_total, loss_recon,loss_physics,_, _ = model(
+                images, slope=slope, precip=precip, mask_ratio=args.mask_ratio)
  
-        loss_value = loss.item()
+        loss_value = loss_total.item()
+        loss_recon_value = loss_recon.item()
+        loss_physics_value = loss_physics.item()
+
+
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training")
+            print(f"loss_recon: {loss_recon_value}, loss_physics: {loss_physics_value}")
             raise ValueError(f"Loss is {loss_value}, stopping training")
  
-        loss /= accum_iter
+        loss_total /= accum_iter
         loss_scaler(
-            loss,
+            loss_total,
             optimizer,
             parameters=model.parameters(),
             update_grad=(data_iter_step + 1) % accum_iter == 0,
         )
+
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
  
@@ -108,15 +125,22 @@ def train_one_epoch_pamae(model: torch.nn.Module,
             torch.cuda.synchronize()
  
         metric_logger.update(loss=loss_value)
+        metric_logger.update(loss_recon=loss_recon_value)
+        metric_logger.update(loss_physics=loss_physics_value)
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
  
         loss_value_reduce = misc.all_reduce_mean(loss_value)
+        loss_recon_reduce = misc.all_reduce_mean(loss_recon_value)
+        loss_physics_reduce = misc.all_reduce_mean(loss_physics_value)
+
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
             epoch_1000x = int(
                 (data_iter_step / len(data_loader) + epoch) * 1000
             )
-            log_writer.add_scalar("train_loss", loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar("train_loss_total", loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar("train_loss_recon", loss_recon_reduce, epoch_1000x)
+            log_writer.add_scalar("train_loss_physics", loss_physics_reduce, epoch_1000x)
             log_writer.add_scalar("lr", lr, epoch_1000x)
  
     metric_logger.synchronize_between_processes()
@@ -145,7 +169,8 @@ def get_args_parser():
         choices=["group_c", "vanilla"], help = "Use channel model"
     )
     parser.add_argument(
-        "--model", default="mae_vit_large_patch16", type=str, help = "Name of model to train"
+       "--model", default="pamae_vit_base_patch16", type=str,
+        choices=["pamae_vit_base_patch16", "pamae_vit_large_patch16"],
     )
 
     # change input size to 96 for PAMAE (instead of 224 for ImageNet)
@@ -162,7 +187,18 @@ def get_args_parser():
     parser.add_argument("--norm_pix_loss", action="store_true",
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
- 
+
+
+    # Physics loss parameters
+    parser.add_argument("--lamba_physics", type=float, default=1.0,
+                        help="Weight for the physics-based coherence loss term (L_total = L_recon + lambda * L_coherence)")
+    
+    parser.add_argument("--slope_threshold", type=float, default=0.33,
+                        help="Normalized slope above which terrain is steep (~30 deg)")
+    parser.add_argument("--precip_threshold", type=float, default=0.3,
+                        help="Normalized precip below which climate is dry (~750mm/yr)")
+
+
     # Optimizer parameters
     parser.add_argument("--weight_decay", type=float, default=0.05,
                         help='Weight decay default=0.05')
@@ -243,15 +279,15 @@ def main(args):
     dataset_train = build_pamae_dataset(args, mode="pretrain")
     print(dataset_train)
 
-    if True:  # distributed path
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print(f"Sampler_train = {sampler_train}")
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    #if True:  # distributed path
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
+    sampler_train = torch.utils.data.DistributedSampler(
+        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    )
+    #    print(f"Sampler_train = {sampler_train}")
+    #else:
+    #    sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -268,36 +304,58 @@ def main(args):
         drop_last=True,
     )
 
-    # define the model
-    if args.model_type == "group_c":
-        if len(args.grouped_bands) == 0:
-            # Default grouping for 11 Sentinel-2 bands:
-            # Visible [B2,B3,B4], Red-Edge [B5,B6,B7],
-            # NIR [B8,B8A], SWIR+WV [B9,B11,B12]
-            args.grouped_bands = [[0, 1, 2], [3, 4, 5], [6, 7], [8, 9, 10]]
-        print(f"Grouping bands {args.grouped_bands}")
 
-        model = models_mae_group_channels.__dict__[args.model](
-            img_size=args.input_size,
-            patch_size=args.patch_size,
-            in_chans=dataset_train.in_c,
-            channel_groups=args.grouped_bands,
-            spatial_mask=args.spatial_mask,
-            norm_pix_loss=args.norm_pix_loss,
-        )
-    else:
-        model = models_mae.__dict__[args.model](
-            img_size=args.input_size,
-            patch_size=args.patch_size,
-            in_chans=dataset_train.in_c,
-            norm_pix_loss=args.norm_pix_loss,
-        )
+    #if args.model_type == "group_c":
+    #    if len(args.grouped_bands) == 0:
+    #        # Default grouping for 11 Sentinel-2 bands:
+    #        # Visible [B2,B3,B4], Red-Edge [B5,B6,B7],
+    #        # NIR [B8,B8A], SWIR+WV [B9,B11,B12]
+    #        args.grouped_bands = [[0, 1, 2], [3, 4, 5], [6, 7], [8, 9, 10]]
+    #    print(f"Grouping bands {args.grouped_bands}")#
+
+    #    model = models_mae_group_channels.__dict__[args.model](
+    #        img_size=args.input_size,
+    #        patch_size=args.patch_size,
+    #        in_chans=dataset_train.in_c,
+    #        channel_groups=args.grouped_bands,
+    #        spatial_mask=args.spatial_mask,
+    #        norm_pix_loss=args.norm_pix_loss,
+    #    )
+    #else:
+    #    model = models_mae.__dict__[args.model](
+    #        img_size=args.input_size,
+    #        patch_size=args.patch_size,
+    #        in_chans=dataset_train.in_c,
+    #        norm_pix_loss=args.norm_pix_loss,
+    #    )
+    #else:
+    #    model = models_mae.__dict__[args.model](
+    #        img_size=args.input_size,
+
+    
+
+    # # ── Build PAMAE model with Coherence Loss ──
+    model = models_mae_pamae.__dict__[args.model](
+        img_size=args.input_size,
+        patch_size=args.patch_size,
+        in_chans=dataset_train.in_c,
+        norm_pix_loss=args.norm_pix_loss,
+        lamba_physics=args.lamba_physics,
+        slope_threshold=args.slope_threshold,
+        precip_threshold=args.precip_threshold,
+    )
+
     model.to(device)
 
     model_without_ddp = model
-    print(f"Model = {model_without_ddp}")
 
+    print(f"Model = {model_without_ddp}")
+    print(f"Physics: lambda={args.lambda_physics}, "
+          f"slope_thresh={args.slope_threshold}, "
+          f"precip_thresh={args.precip_threshold}")
+    
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
+
 
     if args.lr is None:
         args.lr = args.blr * eff_batch_size / 256
