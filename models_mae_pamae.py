@@ -30,7 +30,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from time.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block
 
 from util.pos_embed import get_2d_sincos_pos_embed
 
@@ -83,91 +83,91 @@ class PedologicalCoherenceLoss(nn.Module):
         self.precip_threshold = precip_threshold
         self.darkness_offset = darkness_offset
 
-        def forward(
-                self,
-                pred_patches: torch.Tensor,
-                slope_patches: torch.Tensor,
-                precip: torch.Tensor,
-                mask: torch.Tensor
-        ) -> torch.Tensor:
-            """
-            Compute the coherence penalty
-            
-            Parameters
-            ----------
-            red_patches : (N, L, C*p*p)
-                Reconstructed patches from the MAE decoder (z-score normalized space).
-            slope_patches : (N, L)
-                Mean normalized slope per patch position, in [0, 1].
-            precip : (N,)
-                Normalized precipitation per sample, in [0, 1].
-            mask : (N, L)
-                Binary mask where 1 = masked (reconstructed), 0 = visible.
-    
-            Returns
-            -------
-            coherence_loss : scalar tensor
-                Mean physics penalty across all masked patches in the batch.
-            
-            """
+    def forward(
+        self,
+        pred_patches: torch.Tensor,
+        slope_patches: torch.Tensor,
+        precip: torch.Tensor,
+        mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the coherence penalty
+        
+        Parameters
+        ----------
+        red_patches : (N, L, C*p*p)
+            Reconstructed patches from the MAE decoder (z-score normalized space).
+        slope_patches : (N, L)
+            Mean normalized slope per patch position, in [0, 1].
+        precip : (N,)
+            Normalized precipitation per sample, in [0, 1].
+        mask : (N, L)
+            Binary mask where 1 = masked (reconstructed), 0 = visible.
 
-            # ─── Darkness proxy ──────────────────────────────────────────
-            # In z-score normalized space, more negative values = lower
-            # reflectance = darker = more vegetation/organic matter.
-            # We compute: darkness = -mean(predicted_reflectance_per_patch)
-            # So high darkness = low reflectance = dense vegetation.
-            #
-            # Note: after z-score normalization, values centered ~0.
-            # Negative mean → below-average reflectance → darker than typical.
+        Returns
+        -------
+        coherence_loss : scalar tensor
+            Mean physics penalty across all masked patches in the batch.
+        
+        """
 
-            patch_mean_reflectance = pred_patches.mean(dim=-1)  # (N, L)
-            darkness = -patch_mean_reflectance  # (N, L), higher = darker
+        # ─── Darkness proxy ──────────────────────────────────────────
+        # In z-score normalized space, more negative values = lower
+        # reflectance = darker = more vegetation/organic matter.
+        # We compute: darkness = -mean(predicted_reflectance_per_patch)
+        # So high darkness = low reflectance = dense vegetation.
+        #
+        # Note: after z-score normalization, values centered ~0.
+        # Negative mean → below-average reflectance → darker than typical.
 
-            # shift darkness by offset to control penalty activation threshold
-            darkness = torch.relu(darkness - self.darkness_offset) # (N, L)
+        patch_mean_reflectance = pred_patches.mean(dim=-1)  # (N, L)
+        darkness = -patch_mean_reflectance  # (N, L), higher = darker
 
-            # ─── Relief penalty ─────────────────────────────────────────
-            # Penalize dark reconstructions on steep slopes.
-            # steep_mask: 1 where slope exceeds threshold, 0 otherwise
-            steep_mask = (slope_patches > self.slope_threshold).float()  # (N, L)
+        # shift darkness by offset to control penalty activation threshold
+        darkness = torch.relu(darkness - self.darkness_offset) # (N, L)
 
-            # Penalty scales with both how dark the prediction is and how steep
-            # the slope is (continuous, not just binary threshold)
-            relief_penalty = darkness * steep_mask * slope_patches # (N, L), nonzero only on steep patches
+        # ─── Relief penalty ─────────────────────────────────────────
+        # Penalize dark reconstructions on steep slopes.
+        # steep_mask: 1 where slope exceeds threshold, 0 otherwise
+        steep_mask = (slope_patches > self.slope_threshold).float()  # (N, L)
 
-
-            # ─── Climate penalty ────────────────────────────────────────
-            # Penalize dark reconstructions in dry, flat areas.
-            # dry_mask: 1 where precipitation is below threshold, 0 otherwise
-            dry_mask = (precip < self.precip_threshold).float() # (N,)
-            flat_mask = 1 - steep_mask  # (N, L)
-
-            # Expand precip and dry_mask to patch dimension
-            # dryness_score: how far below the threshold (continuous)
-
-            dryness_score = torch.relu(self.precip_threshold - precip).unsqueeze(1)  # (N, 1)
-
-            climate_penalty = darkness * dry_mask.unsqueeze(1) * flat_mask * dryness_score
+        # Penalty scales with both how dark the prediction is and how steep
+        # the slope is (continuous, not just binary threshold)
+        relief_penalty = darkness * steep_mask * slope_patches # (N, L), nonzero only on steep patches
 
 
-            # ─── Total coherence penalty ───────────────────────────────
-            # Sum relief and climate penalties
-            # Only penalize masked(reconstructed) patches to guide the generative predictions
-            total_penalty = relief_penalty + climate_penalty  # (N, L)
-            total_penalty_masked = total_penalty * mask  # (N, L), zero out visible patches
+        # ─── Climate penalty ────────────────────────────────────────
+        # Penalize dark reconstructions in dry, flat areas.
+        # dry_mask: 1 where precipitation is below threshold, 0 otherwise
+        dry_mask = (precip < self.precip_threshold).float() # (N,)
+        flat_mask = 1 - steep_mask  # (N, L)
+
+        # Expand precip and dry_mask to patch dimension
+        # dryness_score: how far below the threshold (continuous)
+
+        dryness_score = torch.relu(self.precip_threshold - precip).unsqueeze(1)  # (N, 1)
+
+        climate_penalty = darkness * dry_mask.unsqueeze(1) * flat_mask * dryness_score
+
+
+        # ─── Total coherence penalty ───────────────────────────────
+        # Sum relief and climate penalties
+        # Only penalize masked(reconstructed) patches to guide the generative predictions
+        total_penalty = relief_penalty + climate_penalty  # (N, L)
+        total_penalty_masked = total_penalty * mask  # (N, L), zero out visible patches
 
 
 
-            # Mean over all masked patches in the batch
-            num_masked_patches = mask.sum()
+        # Mean over all masked patches in the batch
+        num_masked_patches = mask.sum()
 
-            if num_masked_patches > 0:
-                coherence_loss = total_penalty_masked.sum() / num_masked_patches
-            else:
-                coherence_loss = torch.tensor(0.0, device=pred_patches.device)
+        if num_masked_patches > 0:
+            coherence_loss = total_penalty_masked.sum() / num_masked_patches
+        else:
+            coherence_loss = torch.tensor(0.0, device=pred_patches.device)
 
-            
-            return coherence_loss
+        
+        return coherence_loss
 
 
 class PAMAEViT(MaskedAutoencoderViT):

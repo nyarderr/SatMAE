@@ -190,7 +190,7 @@ def get_args_parser():
 
 
     # Physics loss parameters
-    parser.add_argument("--lamba_physics", type=float, default=1.0,
+    parser.add_argument("--lambda_physics", type=float, default=1.0,
                         help="Weight for the physics-based coherence loss term (L_total = L_recon + lambda * L_coherence)")
     
     parser.add_argument("--slope_threshold", type=float, default=0.33,
@@ -340,7 +340,7 @@ def main(args):
         patch_size=args.patch_size,
         in_chans=dataset_train.in_c,
         norm_pix_loss=args.norm_pix_loss,
-        lamba_physics=args.lamba_physics,
+        lambda_physics=args.lambda_physics,
         slope_threshold=args.slope_threshold,
         precip_threshold=args.precip_threshold,
     )
